@@ -5,6 +5,38 @@ import { useEffect, useMemo, useState } from "react";
 type MarketKey = "KR" | "US" | "CRYPTO";
 type LiquidityAsset = "BTC" | "ETH" | "SOL";
 
+type LiveQuote = {
+  key: string;
+  symbol: string;
+  price: number;
+  previousClose: number;
+  change: number;
+  currency: string;
+  marketTime: number | null;
+};
+
+type MarketFeed = {
+  quotes: Record<string, LiveQuote>;
+  updatedAt: string;
+  source: string;
+};
+
+type DashboardMarket = {
+  label: string;
+  name: string;
+  value: string;
+  change: string;
+  score: number;
+  state: string;
+  stance: string;
+  summary: string;
+  breadth: [number, number];
+  breadthLabel?: string;
+  stats: Array<[string, string, string]>;
+  sectors: Array<[string, number]>;
+  points: string[];
+};
+
 type LiquidityWall = {
   id: string;
   side: "ask" | "bid";
@@ -171,7 +203,84 @@ async function fetchLiquidity(asset: LiquidityAsset, signal: AbortSignal): Promi
   };
 }
 
-const markets = {
+function formatPercent(value: number) {
+  return `${value >= 0 ? "+" : ""}${value.toFixed(2)}%`;
+}
+
+function formatQuoteValue(quote: LiveQuote, index = false) {
+  if (index) return quote.price.toLocaleString("en-US", { maximumFractionDigits: 2 });
+  if (quote.currency === "KRW") return `${Math.round(quote.price).toLocaleString("ko-KR")}원`;
+  return `$${quote.price.toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
+}
+
+function scoreFromChange(change: number) {
+  return Math.max(20, Math.min(90, Math.round(50 + change * 14)));
+}
+
+function strengthFromChange(change: number) {
+  return Math.max(18, Math.min(96, Math.round(52 + change * 14)));
+}
+
+function toneFromChange(change: number) {
+  return change > 0.05 ? "positive" : change < -0.05 ? "negative" : "neutral";
+}
+
+function buildLiveMarket(
+  base: DashboardMarket,
+  primary: LiveQuote,
+  secondary: LiveQuote,
+  leaderA: LiveQuote,
+  leaderB: LiveQuote,
+): DashboardMarket {
+  const average = (primary.change + secondary.change + leaderA.change + leaderB.change) / 4;
+  const rising = [primary, secondary, leaderA, leaderB].filter((quote) => quote.change >= 0).length;
+  const state = primary.change >= 1
+    ? "강세 마감"
+    : primary.change >= 0.2
+      ? "상승 우위"
+      : primary.change > -0.2
+        ? "보합권"
+        : primary.change > -1
+          ? "약세 우위"
+          : "변동성 확대";
+  const stance = primary.change >= 0.2
+    ? "눌림 지지 확인"
+    : primary.change > -0.2
+      ? "방향 확인 우선"
+      : "반등 확인 전 관망";
+  const relation = primary.change >= secondary.change ? `${base.name} 상대 우위` : `${secondary.symbol} 상대 우위`;
+
+  return {
+    ...base,
+    value: formatQuoteValue(primary, true),
+    change: formatPercent(primary.change),
+    score: scoreFromChange(average),
+    state,
+    stance,
+    summary: `${base.name}은 ${formatPercent(primary.change)}, 비교 지수는 ${formatPercent(secondary.change)}로 마감했습니다. 추적 중인 대표 종목은 ${leaderA.symbol} ${formatPercent(leaderA.change)}, ${leaderB.symbol} ${formatPercent(leaderB.change)}입니다. ${stance} 대응이 유리합니다.`,
+    breadth: [rising, 4 - rising],
+    breadthLabel: "추적 자산",
+    stats: [
+      [base.name, formatPercent(primary.change), toneFromChange(primary.change)],
+      [secondary.symbol, formatPercent(secondary.change), toneFromChange(secondary.change)],
+      [leaderA.symbol, formatPercent(leaderA.change), toneFromChange(leaderA.change)],
+      [leaderB.symbol, formatPercent(leaderB.change), toneFromChange(leaderB.change)],
+    ],
+    sectors: [
+      [base.name, strengthFromChange(primary.change)],
+      [secondary.symbol, strengthFromChange(secondary.change)],
+      [leaderA.symbol, strengthFromChange(leaderA.change)],
+      [leaderB.symbol, strengthFromChange(leaderB.change)],
+    ].sort((a, b) => Number(b[1]) - Number(a[1])) as Array<[string, number]>,
+    points: [
+      `${base.name} ${formatPercent(primary.change)} · ${secondary.symbol} ${formatPercent(secondary.change)}`,
+      `${relation}, 대표 종목 확산은 ${rising}/4개`,
+      `${leaderA.symbol}와 ${leaderB.symbol}의 상대강도를 다음 거래일 첫 30분에 재확인`,
+    ],
+  };
+}
+
+const markets: Record<MarketKey, DashboardMarket> = {
   KR: {
     label: "국장",
     name: "KOSPI",
@@ -259,7 +368,7 @@ const markets = {
       "알트/BTC 상대강도 하락으로 무차별 순환매 가능성은 낮음",
     ],
   },
-} as const;
+};
 
 const candidates = [
   {
@@ -430,9 +539,10 @@ export default function Home() {
   const [liveLiquidity, setLiveLiquidity] = useState<Partial<Record<LiquidityAsset, LiquiditySnapshot>>>({});
   const [liquidityStatus, setLiquidityStatus] = useState<"loading" | "live" | "error">("loading");
   const [liquidityUpdatedAt, setLiquidityUpdatedAt] = useState("");
+  const [marketFeed, setMarketFeed] = useState<MarketFeed | null>(null);
+  const [marketStatus, setMarketStatus] = useState<"loading" | "live" | "error">("loading");
   const [refreshNonce, setRefreshNonce] = useState(0);
 
-  const active = markets[activeMarket];
   const selected = candidates.find((item) => item.id === selectedId) ?? candidates[0];
   const filtered = useMemo(
     () => candidates.filter((item) => filter === "ALL" || item.market === filter),
@@ -443,6 +553,109 @@ export default function Home() {
   const selectedLive = selected.id === "BTC" || selected.id === "ETH"
     ? liveLiquidity[selected.id]
     : undefined;
+  const displayMarkets = useMemo<Record<MarketKey, DashboardMarket>>(() => {
+    const quotes = marketFeed?.quotes;
+    const next = { ...markets };
+    if (quotes?.kospi && quotes.kosdaq && quotes.samsung && quotes.skhynix) {
+      next.KR = buildLiveMarket(markets.KR, quotes.kospi, quotes.kosdaq, quotes.samsung, quotes.skhynix);
+    }
+    if (quotes?.nasdaq && quotes.sp500 && quotes.nvda && quotes.msft) {
+      next.US = buildLiveMarket(markets.US, quotes.nasdaq, quotes.sp500, quotes.nvda, quotes.msft);
+    }
+    const btc = liveLiquidity.BTC;
+    const btcChange = Number(btc?.change24h?.replace("%", ""));
+    if (btc && Number.isFinite(btcChange)) {
+      const rising = btcChange >= 0 ? 1 : 0;
+      next.CRYPTO = {
+        ...markets.CRYPTO,
+        value: btc.current,
+        change: btc.change24h ?? markets.CRYPTO.change,
+        score: scoreFromChange(btcChange),
+        state: btcChange >= 1 ? "상승 우위" : btcChange > -1 ? "중립 구간" : "하락 변동성",
+        stance: btcChange >= 0 ? "아래 매물대 지지 확인" : "위쪽 매물대 회복 확인",
+        summary: btc.summary,
+        breadth: [rising, 1 - rising],
+        breadthLabel: "BTC 24시간",
+        stats: [
+          ["BTC 24H", formatPercent(btcChange), toneFromChange(btcChange)],
+          ["매수 호가 비중", `${btc.balance}%`, btc.balance >= 50 ? "positive" : "negative"],
+          ["아래/위 물량", btc.imbalance, btc.balance >= 50 ? "positive" : "negative"],
+          ["데이터", "Binance 현물", "neutral"],
+        ],
+        sectors: [
+          ["매수 유동성", btc.balance],
+          ["매도 유동성", 100 - btc.balance],
+          ["위쪽 매물대", 65],
+          ["아래쪽 매물대", 65],
+        ],
+        points: [
+          `BTC 현재가 ${btc.current} · 24시간 ${formatPercent(btcChange)}`,
+          `아래쪽 최대 매물대 ${btc.buyWall} · 위쪽 최대 매물대 ${btc.sellWall}`,
+          "호가 주문은 체결 전에 취소될 수 있어 실제 체결 흐름과 함께 확인",
+        ],
+      };
+    }
+    return next;
+  }, [liveLiquidity.BTC, marketFeed]);
+  const active = displayMarkets[activeMarket];
+  const stockQuoteKeys: Record<string, string> = {
+    "005930": "samsung",
+    "000660": "skhynix",
+    NVDA: "nvda",
+    MSFT: "msft",
+  };
+  const selectedStockQuote = marketFeed?.quotes[stockQuoteKeys[selected.id]];
+  const selectedPrice = selectedStockQuote ? formatQuoteValue(selectedStockQuote) : selectedLive?.current ?? selected.price;
+  const selectedChange = selectedStockQuote ? formatPercent(selectedStockQuote.change) : selectedLive?.change24h ?? selected.change;
+  const candidateDisplay = (id: string, price: string, change: string) => {
+    const quote = marketFeed?.quotes[stockQuoteKeys[id]];
+    if (quote) return { price: formatQuoteValue(quote), change: formatPercent(quote.change) };
+    const crypto = id === "BTC" || id === "ETH" ? liveLiquidity[id] : undefined;
+    return { price: crypto?.current ?? price, change: crypto?.change24h ?? change };
+  };
+  const compositeScore = useMemo(() => {
+    const changes = [marketFeed?.quotes.kospi?.change, marketFeed?.quotes.nasdaq?.change];
+    const btcChange = Number(liveLiquidity.BTC?.change24h?.replace("%", ""));
+    if (Number.isFinite(btcChange)) changes.push(btcChange);
+    const valid = changes.filter((value): value is number => Number.isFinite(value));
+    return valid.length ? scoreFromChange(valid.reduce((sum, value) => sum + value, 0) / valid.length) : 50;
+  }, [liveLiquidity.BTC?.change24h, marketFeed]);
+  const marketsReady = marketStatus === "live" && liquidityStatus === "live";
+  const heroHeadline = compositeScore >= 65
+    ? "위험선호가 우세한 장"
+    : compositeScore >= 48
+      ? "선별매매가 필요한 장"
+      : "방어적으로 확인할 장";
+  const positionSize = compositeScore >= 65 ? "평소의 80%" : compositeScore >= 48 ? "평소의 60%" : "평소의 35%";
+
+  useEffect(() => {
+    const controller = new AbortController();
+    const loadMarkets = async () => {
+      setMarketStatus("loading");
+      try {
+        const response = await fetch("/api/markets", { cache: "no-store", signal: controller.signal });
+        if (!response.ok) {
+          const detail = await response.text();
+          throw new Error(`Market feed ${response.status}: ${detail.slice(0, 800)}`);
+        }
+        const payload = (await response.json()) as MarketFeed;
+        if (!payload.quotes?.kospi || !payload.quotes?.nasdaq) throw new Error("Incomplete market feed");
+        setMarketFeed(payload);
+        setMarketStatus("live");
+      } catch (error) {
+        if (!controller.signal.aborted) {
+          console.error("Stock market refresh failed", error);
+          setMarketStatus("error");
+        }
+      }
+    };
+    void loadMarkets();
+    const interval = window.setInterval(loadMarkets, 300_000);
+    return () => {
+      controller.abort();
+      window.clearInterval(interval);
+    };
+  }, [refreshNonce]);
 
   useEffect(() => {
     const controller = new AbortController();
@@ -513,7 +726,7 @@ export default function Home() {
           <a href="#scenario">내일 시나리오</a>
         </nav>
         <div className="top-actions">
-          <span className={`demo-chip ${liveLiquidity.BTC ? "live-chip" : ""}`}><i /> {liveLiquidity.BTC ? "CRYPTO LIVE · 주식 DEMO" : "데이터 연결 중"}</span>
+          <span className={`demo-chip ${marketsReady ? "live-chip" : ""}`}><i /> {marketsReady ? "MARKETS LIVE · 모델 분석" : marketStatus === "error" || liquidityStatus === "error" ? "일부 데이터 연결 실패" : "데이터 연결 중"}</span>
           <button className="refresh-button" onClick={refresh} aria-label="분석 새로고침">
             <span>↻</span> {updatedAt}
           </button>
@@ -523,18 +736,18 @@ export default function Home() {
       <div className="app-shell" id="top">
         <section className="hero-grid">
           <article className="hero-panel">
-            <div className="eyebrow"><span>크립토 실시간</span><i />주식 분석 샘플</div>
+            <div className="eyebrow"><span>국장·미장·크립토 실시간</span><i />등락 기반 모델 분석</div>
             <div className="hero-copy">
               <p>오늘의 시장 대응</p>
-              <h1>기회는 있지만,<br /><strong>선별매매가 필요한 장</strong></h1>
+              <h1>실시간 흐름 기준,<br /><strong>{heroHeadline}</strong></h1>
               <p className="hero-summary">
-                국장과 미장은 대형 기술주 중심으로 추세가 유지되고 있습니다. 다만 시장 전체로 매수세가 퍼지지 않아 지수 추격보다 <b>거래대금이 확인된 주도주 눌림</b>에 집중하는 편이 유리합니다.
+                KOSPI <b>{displayMarkets.KR.change}</b>, NASDAQ <b>{displayMarkets.US.change}</b>, BTC <b>{displayMarkets.CRYPTO.change}</b>를 함께 반영했습니다. 현재 지수와 대표 종목의 상대강도를 비교해 <b>추격보다 확인 매매</b>를 우선합니다.
               </p>
             </div>
             <div className="action-row">
-              <div><span>추천 대응</span><b>주도주 눌림 선별</b></div>
-              <div><span>피해야 할 매매</span><b>장중 고점 추격</b></div>
-              <div><span>포지션 강도</span><b>평소의 60%</b></div>
+              <div><span>추천 대응</span><b>{compositeScore >= 55 ? "강한 자산 눌림 확인" : "첫 반등 확인 후 진입"}</b></div>
+              <div><span>피해야 할 매매</span><b>{compositeScore >= 65 ? "거래량 없는 돌파 추격" : "약세 자산 물타기"}</b></div>
+              <div><span>포지션 강도</span><b>{positionSize}</b></div>
             </div>
           </article>
 
@@ -544,11 +757,11 @@ export default function Home() {
               <button aria-label="시장 온도 설명">?</button>
             </div>
             <div className="gauge-wrap">
-              <div className="gauge"><span><b>64</b><small>/ 100</small></span></div>
-              <div className="gauge-labels"><span>위험회피</span><b>선별적 위험선호</b><span>과열</span></div>
+              <div className="gauge"><span><b>{compositeScore}</b><small>/ 100</small></span></div>
+              <div className="gauge-labels"><span>위험회피</span><b>{heroHeadline}</b><span>과열</span></div>
             </div>
             <div className="score-list">
-              {[["추세", 72], ["수급", 61], ["시장 폭", 54], ["변동성", 43]].map(([label, value]) => (
+              {[["국장", displayMarkets.KR.score], ["미장", displayMarkets.US.score], ["크립토", displayMarkets.CRYPTO.score], ["종합", compositeScore]].map(([label, value]) => (
                 <div key={String(label)}><span>{label}</span><i><b style={{ width: `${value}%` }} /></i><em>{value}</em></div>
               ))}
             </div>
@@ -557,10 +770,9 @@ export default function Home() {
 
         <section className="market-overview" aria-label="시장별 상태">
           {(Object.keys(markets) as MarketKey[]).map((key) => {
-            const item = markets[key];
-            const liveCrypto = key === "CRYPTO" ? liveLiquidity.BTC : undefined;
-            const displayValue = liveCrypto?.current ?? item.value;
-            const displayChange = liveCrypto?.change24h ?? item.change;
+            const item = displayMarkets[key];
+            const displayValue = item.value;
+            const displayChange = item.change;
             const bars = key === "KR" ? [35, 48, 44, 61, 57, 68, 66, 79, 74, 86, 82, 91] : key === "US" ? [28, 35, 46, 43, 52, 57, 69, 63, 76, 72, 83, 88] : [46, 68, 52, 61, 43, 54, 72, 65, 58, 79, 68, 84];
             return (
               <button
@@ -599,13 +811,13 @@ export default function Home() {
                 ))}
               </div>
               <div className="breadth">
-                <div><span>시장 폭</span><em>상승 {active.breadth[0]} · 하락 {active.breadth[1]}</em></div>
+                <div><span>{active.breadthLabel ?? "시장 폭"}</span><em>상승 {active.breadth[0]} · 하락 {active.breadth[1]}</em></div>
                 <i><b style={{ width: `${(active.breadth[0] / (active.breadth[0] + active.breadth[1])) * 100}%` }} /></i>
               </div>
             </article>
 
             <article className="sector-panel">
-              <div className="small-heading"><span>자금 흐름</span><b>강도</b></div>
+              <div className="small-heading"><span>추적 자산 상대강도</span><b>강도</b></div>
               <div className="sector-list">
                 {active.sectors.map(([sector, strength], index) => (
                   <div key={sector}><span><i>{index + 1}</i>{sector}</span><b><i style={{ width: `${strength}%` }} /></b><em>{strength}</em></div>
@@ -637,20 +849,23 @@ export default function Home() {
               </div>
               <div className="scanner-table">
                 <div className="table-row table-head"><span>종목</span><span>탐지 조건</span><span>강도</span><span>거래량</span><span>등락</span><span /></div>
-                {filtered.map((item) => (
+                {filtered.map((item) => {
+                  const live = candidateDisplay(item.id, item.price, item.change);
+                  return (
                   <button className={`table-row ${selected.id === item.id ? "selected" : ""}`} key={item.id} onClick={() => setSelectedId(item.id)}>
                     <span className="asset-cell"><i>{item.market === "KR" ? "K" : item.market === "US" ? "U" : "C"}</i><b>{item.name}<small>{item.ticker}</small></b></span>
                     <span><em className="signal-chip">{item.signal}</em></span>
                     <span className="strength-cell"><i><b style={{ width: `${item.strength}%` }} /></i><em>{item.strength}</em></span>
-                    <span>{item.volume}</span><span className={item.change.startsWith("+") ? "positive" : "negative"}>{item.change}</span><span>›</span>
+                    <span>{item.volume}</span><span className={live.change.startsWith("+") ? "positive" : "negative"}>{live.change}</span><span>›</span>
                   </button>
-                ))}
+                  );
+                })}
               </div>
             </article>
 
             <aside className="candidate-detail">
               <div className="detail-top"><span className="market-tag">{markets[selected.market].label}</span><button onClick={() => toggleWatch(selected.id)} aria-label="관심종목 토글">{watchlist.includes(selected.id) ? "★" : "☆"}</button></div>
-              <div className="asset-title"><div><p>{selected.ticker}</p><h3>{selected.name}</h3></div><div><b>{selectedLive?.current ?? selected.price}</b><span>{selectedLive?.change24h ?? selected.change}</span></div></div>
+              <div className="asset-title"><div><p>{selected.ticker}</p><h3>{selected.name}</h3></div><div><b>{selectedPrice}</b><span>{selectedChange}</span></div></div>
               <div className="setup-score"><div><span>SETUP SCORE</span><b>{selected.strength}</b></div><i><b style={{ width: `${selected.strength}%` }} /></i></div>
               <dl>
                 <div><dt>관찰 이유</dt><dd>{selected.reason}</dd></div>
@@ -755,15 +970,15 @@ export default function Home() {
 
         <footer>
           <div className="brand footer-brand"><span className="brand-mark"><i /><i /><i /></span><span>MARKET <b>COMPASS</b></span></div>
-          <p>크립토 가격·매물대는 Binance 현물 실시간 데이터이며, 국장·미장 분석은 아직 샘플입니다.</p>
-          <span>V0.4 · DECISION SUPPORT, NOT A SIGNAL</span>
+          <p>국장·미장 가격은 Yahoo Finance, 크립토 가격·매물대는 Binance 현물 데이터를 사용하며 분석 문구는 등락 기반 모델이 자동 생성합니다.</p>
+          <span>V0.5 · LIVE DATA, MODEL ANALYSIS</span>
         </footer>
       </div>
 
       <nav className="mobile-nav" aria-label="모바일 메뉴">
         <a href="#top"><i>⌂</i><span>시장</span></a><a href="#close-brief"><i>◫</i><span>마감</span></a><a href="#scanner"><i>⌁</i><span>탐지</span></a><a href="#liquidity"><i>≋</i><span>매물대</span></a><a href="#scenario"><i>◇</i><span>시나리오</span></a>
       </nav>
-      {toast && <div className="toast">✓ 크립토 매물대 새로고침 요청</div>}
+      {toast && <div className="toast">✓ 전체 시장 데이터 새로고침 요청</div>}
     </main>
   );
 }
