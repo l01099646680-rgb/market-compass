@@ -19,6 +19,9 @@ type YahooChart = {
         regularMarketTime?: number;
         currency?: string;
       };
+      indicators?: {
+        quote?: Array<{ close?: Array<number | null> }>;
+      };
     }>;
   };
 };
@@ -41,9 +44,14 @@ async function fetchQuote(key: string, symbol: string) {
       );
       if (!response.ok) throw new Error(`Yahoo ${response.status}`);
       const payload = (await response.json()) as YahooChart;
-      const meta = payload.chart?.result?.[0]?.meta;
+      const result = payload.chart?.result?.[0];
+      const meta = result?.meta;
       const price = Number(meta?.regularMarketPrice);
-      const previousClose = Number(meta?.chartPreviousClose ?? meta?.previousClose);
+      const closes = (result?.indicators?.quote?.[0]?.close ?? []).filter(
+        (value): value is number => typeof value === "number" && Number.isFinite(value),
+      );
+      const seriesPrevious = closes.length >= 2 ? closes.at(-2) : undefined;
+      const previousClose = Number(seriesPrevious ?? meta?.previousClose ?? meta?.chartPreviousClose);
       if (!Number.isFinite(price) || !Number.isFinite(previousClose) || previousClose <= 0) {
         throw new Error("Invalid quote payload");
       }
